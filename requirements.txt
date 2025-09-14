@@ -1,0 +1,7 @@
+streamlit
+sentence-transformers
+faiss-cpu
+pdfplumber
+nltk
+rank_bm25
+numpy

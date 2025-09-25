@@ -12,4 +12,6 @@ pypdf
 langchain-community
 langchain-text-splitters
 langchain-huggingface
+langchain_groq
+
 

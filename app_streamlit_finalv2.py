@@ -19,30 +19,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 SOURCE_URL = "http://www.ipindia.gov.in/ (FREQUENTLY ASKED QUESTIONS - PATENTS)"
 
-# -------------------------------
-# Streamlit Page
-# -------------------------------
 st.set_page_config(page_title="Patent FAQ Chatbot", page_icon="📘", layout="wide")
 st.title("📘 Patent FAQ Chatbot (India)")
-
-# Sidebar for KB Management
-st.sidebar.header("📂 Knowledge Base Management")
-uploaded_files = st.sidebar.file_uploader("Upload PDF(s)", type=["pdf"], accept_multiple_files=True)
-if uploaded_files:
-    for uf in uploaded_files:
-        save_path = os.path.join(DATA_DIR, uf.name)
-        with open(save_path, "wb") as f:
-            f.write(uf.getbuffer())
-    st.sidebar.success(f"Uploaded {len(uploaded_files)} file(s).")
-
-# Show current KB files
-kb_files = [f for f in os.listdir(DATA_DIR) if f.endswith(".pdf")]
-if kb_files:
-    st.sidebar.subheader("📑 Current KB Files")
-    for f in kb_files:
-        st.sidebar.write(f"📄 {f}")
-else:
-    st.sidebar.warning("⚠️ No PDFs uploaded yet.")
 
 # -------------------------------
 # Load Knowledge Base
@@ -75,77 +53,44 @@ def load_knowledge_base():
     return vectorstore.as_retriever(search_kwargs={"k": 5}), bm25_index, kb_texts
 
 # -------------------------------
-# Handle Meta-History Questions - FIXED
+# Handle Meta-History Questions
 # -------------------------------
-def handle_history_question(query: str, chat_history: list) -> tuple[str | None, bool]:
-    """Detect and respond to questions about conversation history - improved detection."""
+def handle_history_question(query: str, chat_history: list):
+    """Detect and respond to questions about conversation history."""
     query_lower = query.lower().strip()
-    meta_patterns = [
-        r'previous question|last question|what did i ask|what was my last',
-        r'history|conversation history|chat history|previous chat',
-        r'what did you answer before|last answer'
-    ]
-    
-    if any(re.search(pattern, query_lower) for pattern in meta_patterns):
+    if any(x in query_lower for x in ["previous question", "last question"]):
         if not chat_history:
-            return "No previous questions in this conversation yet.", True
-        
-        # Get recent history (last 3-5 turns)
-        recent_n = min(5, len(chat_history))
-        recent = chat_history[-recent_n:]
-        history_summary = f"Recent conversation history ({len(recent)} turns):\n\n"
-        for i, (q, a) in enumerate(recent[::-1], 1):  # Newest first
-            history_summary += f"{i}. **You:** {q}\n   **Bot:** {a[:150]}...\n\n"
-        
-        # Specific to previous/last
-        if re.search(r'previous|last', query_lower):
-            last_q, last_a = chat_history[-1]
-            if re.search(r'answer|reply', query_lower):
-                return f"Your previous question: '{last_q}'\n\nPrevious answer: {last_a[:300]}...\n\nFull recent history:\n{history_summary}", True
-            else:
-                return f"Your previous question was: '{last_q}'\n\nFull recent history:\n{history_summary}", True
-        
-        return history_summary, True
-    
+            return "No previous question yet.", True
+        last_q, _ = chat_history[-1]
+        return f"Your previous question was: '{last_q}'", True
     return None, False
 
 # -------------------------------
-# Related Question Suggestions - FIXED for Gibberish
+# Related Question Suggestions
 # -------------------------------
 def suggest_related_questions(query, bm25_index, kb_texts, top_n=3):
     if not bm25_index or not kb_texts:
         return []
-    
     keywords = re.findall(r"\w+", query.lower())
-    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'type', 'text', 'updated', 'revision', 'june', 'part', 'frequently', 'asked', 'questions', '[type', 'text]'}
+    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
     keywords = [kw for kw in keywords if kw not in stop_words and len(kw) > 2]
-    
     if not keywords:
         return []
-    
     scores = bm25_index.get_scores(keywords)
     ranked = sorted(zip(scores, kb_texts), key=lambda x: x[0], reverse=True)
-    
     suggestions = []
-    for _, text in ranked[:top_n * 3]:  # More candidates to filter gibberish
-        # Split into sentences and filter meaningful ones
+    for _, text in ranked[:top_n * 3]:
         sentences = re.split(r'[.!?]+', text)
         for s in sentences:
-            s_clean = re.sub(r'[^a-zA-Z0-9\s\?\!]', '', s.strip())  # Clean artifacts
-            if (len(s_clean) > 40 and len(s_clean) < 150 and 
-                any(kw in s_clean.lower() for kw in keywords) and 
-                not any(artifact in s_clean.lower() for artifact in ['type text', 'updated revision', 'june 2018', 'part - generic']) and
-                s_clean not in suggestions):
-                # Format as question if not already
-                if not s_clean.endswith('?'):
-                    s_clean += '?'
+            s_clean = s.strip()
+            if 40 < len(s_clean) < 150 and any(kw in s_clean.lower() for kw in keywords):
+                if not s_clean.endswith("?"):
+                    s_clean += "?"
                 suggestions.append(s_clean)
-                break  # One per chunk
-        
+                break
         if len(suggestions) >= top_n:
             break
-    
-    return suggestions[:top_n] if suggestions else ["What is the patent application procedure?", "How to file a patent in India?", "What are patent fees?"]  # Fallback
+    return suggestions[:top_n]
 
 # -------------------------------
 # Clean Answer
@@ -153,15 +98,51 @@ def suggest_related_questions(query, bm25_index, kb_texts, top_n=3):
 def clean_answer(text):
     if not text.strip():
         return "I don't have a specific answer in the knowledge base."
-    # Remove gibberish/artifacts
-    text = re.sub(r'\[type text\]|\(revision \d+\)|updated: june \d+|part - generic issues', '', text)
-    sentences = [s.strip() for s in text.split(".") if s.strip() and len(s.strip()) > 10]
+    sentences = [s.strip() for s in text.split(".") if len(s.strip()) > 10]
     seen, cleaned = set(), []
     for s in sentences:
         if s not in seen:
             cleaned.append(s)
             seen.add(s)
     return ". ".join(cleaned) + "." if cleaned else text.strip()[:300]
+
+# -------------------------------
+# Sidebar: KB Management
+# -------------------------------
+st.sidebar.header("📂 Knowledge Base Management")
+
+# Show current KB files
+kb_files = [f for f in os.listdir(DATA_DIR) if f.endswith(".pdf")]
+if kb_files:
+    st.sidebar.subheader("📑 Current KB Files")
+    for f in kb_files:
+        st.sidebar.write(f"📄 {f}")
+else:
+    st.sidebar.warning("⚠️ No PDFs found in knowledge_base folder.")
+
+# File uploader for new PDFs
+uploaded_files = st.sidebar.file_uploader(
+    "Upload additional PDF(s)", type=["pdf"], accept_multiple_files=True
+)
+
+if uploaded_files:
+    for uf in uploaded_files:
+        save_path = os.path.join(DATA_DIR, uf.name)
+        with open(save_path, "wb") as f:
+            f.write(uf.getbuffer())
+        st.sidebar.success(f"✅ Added: {uf.name}")
+    # Reload KB instantly
+    retriever, bm25_index, kb_texts = load_knowledge_base()
+    if retriever:
+        st.session_state.qa_chain = ConversationalRetrievalChain.from_llm(
+            llm=st.session_state.llm,
+            retriever=retriever,
+            return_source_documents=True,
+            combine_docs_chain_kwargs={"prompt": st.session_state.prompt}
+        )
+        st.session_state.bm25_index = bm25_index
+        st.session_state.kb_texts = kb_texts
+        st.sidebar.success("🔄 Knowledge Base reloaded with new files!")
 
 # -------------------------------
 # Initialize Session
@@ -179,7 +160,6 @@ if "qa_chain" not in st.session_state:
                     temperature=0,
                     max_tokens=512
                     )
-
             prompt_template = """Use the following context to answer the user’s question.
 If you don’t know, just say so. Do not add extra info.
 
@@ -188,14 +168,14 @@ If you don’t know, just say so. Do not add extra info.
 Question: {question}
 Answer:"""
             PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-
             qa_chain = ConversationalRetrievalChain.from_llm(
                 llm,
                 retriever=retriever,
                 return_source_documents=True,
                 combine_docs_chain_kwargs={"prompt": PROMPT}
             )
-
+            st.session_state.llm = llm
+            st.session_state.prompt = PROMPT
             st.session_state.qa_chain = qa_chain
             st.session_state.bm25_index = bm25_index
             st.session_state.kb_texts = kb_texts
@@ -211,29 +191,23 @@ if "chat_history" not in st.session_state:
 query = st.text_input("💬 Ask a question about patents in India:")
 
 if query and st.session_state.qa_chain:
-    # Check for meta-history question first - FIXED
     meta_response, is_meta = handle_history_question(query, st.session_state.chat_history)
     if is_meta:
         answer = meta_response
         sources = []
         related = []
     else:
-        # Use full history for context in chain
         result = st.session_state.qa_chain.invoke({"question": query, "chat_history": st.session_state.chat_history})
         raw_answer = result["answer"]
         answer = clean_answer(raw_answer)
-
         sources = []
         for doc in result.get("source_documents", []):
             source_file = os.path.basename(doc.metadata.get("source", ""))
             page = doc.metadata.get("page", "N/A")
             sources.append(f"{source_file} (Page {page})")
-
         related = suggest_related_questions(query, st.session_state.bm25_index, st.session_state.kb_texts)
 
     st.session_state.chat_history.append((query, answer))
-
-    # Display response
     st.markdown(f"**You:** {query}")
     st.markdown(f"**Bot:** {answer}")
 
@@ -245,17 +219,17 @@ if query and st.session_state.qa_chain:
     if related:
         st.info("💡 Suggested Related Questions:")
         for rq in related:
-            st.markdown(f"- {rq}")  # Non-clickable text
+            st.markdown(f"- {rq}")
 
 # -------------------------------
-# Display Chat History - LIFO (Newest First)
+# Display Chat History
 # -------------------------------
 if st.session_state.chat_history:
     st.subheader("📝 Conversation History")
-    for q, a in reversed(st.session_state.chat_history):  # LIFO: Newest first
+    for q, a in reversed(st.session_state.chat_history):
         st.markdown(f"**You:** {q}")
         st.markdown(f"**Bot:** {a}")
-        st.markdown(" ")  # Minimal spacing
+        st.markdown(" ")
 
 st.markdown("---")
 st.caption("Patent FAQ Chatbot • Powered by Groq & LangChain • Strictly based on provided KB documents")

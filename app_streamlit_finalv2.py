@@ -1,14 +1,16 @@
 import os
 import re
-import hashlib
 import streamlit as st
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
-from langchain.chains.conversational_retrieval.base import ConversationalRetrievalChain  # ✅ Fixed import
-from langchain.prompts import PromptTemplate
+from langchain.prompts import PromptTemplate  # Kept for potential future use; not central now
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
 try:
     from rank_bm25 import BM25Okapi
 except ImportError:
@@ -112,6 +114,54 @@ def clean_answer(text):
     return ". ".join(cleaned) + "." if cleaned else text.strip()[:300]
 
 # -------------------------------
+# Create LCEL QA Chain
+# -------------------------------
+def create_convo_qa_chain(llm, retriever):
+    """Create the LCEL conversational retrieval chain."""
+    # Condense question prompt (rephrase using history)
+    condense_question_system_template = (
+        "Given a chat history and the latest user question "
+        "which might reference context in the chat history, "
+        "formulate a standalone question which can be understood "
+        "without the chat history. Do NOT answer the question, "
+        "just reformulate it if needed and otherwise return it as is."
+    )
+    condense_question_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", condense_question_system_template),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+
+    # History-aware retriever
+    history_aware_retriever = create_history_aware_retriever(
+        llm, retriever, condense_question_prompt
+    )
+
+    # QA prompt (adapted from original: context + question, with history)
+    system_prompt = (
+        "Use the following pieces of retrieved context to answer the user’s question. "
+        "If you don’t know, just say so. Do not add extra info. "
+        "\n\n"
+        "{context}"
+    )
+    qa_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+
+    # Stuff documents chain
+    qa_chain = create_stuff_documents_chain(llm, qa_prompt)
+
+    # Full retrieval chain
+    convo_qa_chain = create_retrieval_chain(history_aware_retriever, qa_chain)
+    return convo_qa_chain
+
+# -------------------------------
 # Sidebar: KB Management
 # -------------------------------
 st.sidebar.header("📂 Knowledge Base Management")
@@ -138,14 +188,9 @@ if uploaded_files:
         st.sidebar.success(f"✅ Added: {uf.name}")
     # Reload KB instantly
     retriever, bm25_index, kb_texts = load_knowledge_base()
-    if retriever:
+    if retriever and "llm" in st.session_state:
         try:
-            st.session_state.qa_chain = ConversationalRetrievalChain.from_llm(
-                llm=st.session_state.llm,
-                retriever=retriever,
-                return_source_documents=True,
-                combine_docs_chain_kwargs={"prompt": st.session_state.prompt}
-            )
+            st.session_state.qa_chain = create_convo_qa_chain(st.session_state.llm, retriever)
             st.session_state.bm25_index = bm25_index
             st.session_state.kb_texts = kb_texts
             st.sidebar.success("🔄 Knowledge Base reloaded with new files!")
@@ -165,26 +210,12 @@ if "qa_chain" not in st.session_state:
             try:
                 llm = ChatGroq(
                         api_key=groq_api_key,
-                        model="openai/gpt-oss-20b",   # ✅ Valid Groq model (as of Aug 2025)
+                        model="openai/gpt-oss-20b",
                         temperature=0,
                         max_tokens=512
                         )
-                prompt_template = """Use the following context to answer the user’s question.
-If you don’t know, just say so. Do not add extra info.
-
-{context}
-
-Question: {question}
-Answer:"""
-                PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-                qa_chain = ConversationalRetrievalChain.from_llm(
-                    llm,
-                    retriever=retriever,
-                    return_source_documents=True,
-                    combine_docs_chain_kwargs={"prompt": PROMPT}
-                )
+                qa_chain = create_convo_qa_chain(llm, retriever)
                 st.session_state.llm = llm
-                st.session_state.prompt = PROMPT
                 st.session_state.qa_chain = qa_chain
                 st.session_state.bm25_index = bm25_index
                 st.session_state.kb_texts = kb_texts
@@ -208,11 +239,21 @@ if query and st.session_state.qa_chain:
         sources = []
         related = []
     else:
-        result = st.session_state.qa_chain.invoke({"question": query, "chat_history": st.session_state.chat_history})
+        # Convert chat_history to messages
+        chat_history_msgs = []
+        for human, ai in st.session_state.chat_history:
+            chat_history_msgs.extend([HumanMessage(content=human), AIMessage(content=ai)])
+        
+        result = st.session_state.qa_chain.invoke(
+            {
+                "input": query,
+                "chat_history": chat_history_msgs,
+            }
+        )
         raw_answer = result["answer"]
         answer = clean_answer(raw_answer)
         sources = []
-        for doc in result.get("source_documents", []):
+        for doc in result.get("context", []):
             source_file = os.path.basename(doc.metadata.get("source", ""))
             page = doc.metadata.get("page", "N/A")
             sources.append(f"{source_file} (Page {page})")
@@ -243,4 +284,4 @@ if st.session_state.chat_history:
         st.markdown(" ")
 
 st.markdown("---")
-st.caption("Patent FAQ Chatbot • Powered by Groq & LangChain • Strictly based on provided KB documents")
+st.caption("Patent FAQ Chatbot • Powered by Groq & LangChain (LCEL) • Strictly based on provided KB documents")

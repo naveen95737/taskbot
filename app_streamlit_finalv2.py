@@ -6,7 +6,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
-from langchain.prompts import PromptTemplate  # Kept for potential future use; not central now
+
 from langchain.chains.history_aware_retriever import create_history_aware_retriever  # ✅ Fixed submodule
 from langchain.chains.retrieval import create_retrieval_chain  # ✅ Fixed submodule
 from langchain.chains.combine_documents import create_stuff_documents_chain

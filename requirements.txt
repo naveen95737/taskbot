@@ -1,17 +1,32 @@
+# Core App Dependencies
 streamlit
-sentence-transformers
-faiss-cpu
-pdfplumber
-nltk
-rank_bm25
 numpy
 torch
-langchain
+
+# NLP & Embeddings
 transformers
+sentence-transformers
+nltk
+
+# PDF Processing
+pdfplumber
 pypdf
+
+# Vector Databases and Retrieval
+faiss-cpu
+rank_bm25
+
+# LangChain Ecosystem (latest modular setup)
+langchain
+langchain-core
 langchain-community
 langchain-text-splitters
 langchain-huggingface
-langchain_groq
+langchain-groq
+
+# Optional but Recommended (for safety in Streamlit deployments)
+tqdm
+
+
 
 

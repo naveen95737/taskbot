@@ -7,9 +7,13 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
-from langchain_community.chains import ConversationalRetrievalChain
+from langchain.chains.conversational_retrieval.base import ConversationalRetrievalChain  # ✅ Fixed import
 from langchain.prompts import PromptTemplate
-from rank_bm25 import BM25Okapi
+try:
+    from rank_bm25 import BM25Okapi
+except ImportError:
+    st.error("Missing 'rank_bm25' package. Install via 'pip install rank_bm25'.")
+    BM25Okapi = None
 
 
 # -------------------------------
@@ -135,15 +139,18 @@ if uploaded_files:
     # Reload KB instantly
     retriever, bm25_index, kb_texts = load_knowledge_base()
     if retriever:
-        st.session_state.qa_chain = ConversationalRetrievalChain.from_llm(
-            llm=st.session_state.llm,
-            retriever=retriever,
-            return_source_documents=True,
-            combine_docs_chain_kwargs={"prompt": st.session_state.prompt}
-        )
-        st.session_state.bm25_index = bm25_index
-        st.session_state.kb_texts = kb_texts
-        st.sidebar.success("🔄 Knowledge Base reloaded with new files!")
+        try:
+            st.session_state.qa_chain = ConversationalRetrievalChain.from_llm(
+                llm=st.session_state.llm,
+                retriever=retriever,
+                return_source_documents=True,
+                combine_docs_chain_kwargs={"prompt": st.session_state.prompt}
+            )
+            st.session_state.bm25_index = bm25_index
+            st.session_state.kb_texts = kb_texts
+            st.sidebar.success("🔄 Knowledge Base reloaded with new files!")
+        except Exception as e:
+            st.sidebar.error(f"❌ Reload failed: {str(e)}")
 
 # -------------------------------
 # Initialize Session
@@ -155,31 +162,34 @@ if "qa_chain" not in st.session_state:
         if not groq_api_key:
             st.error("⚠️ Please set your GROQ_API_KEY in Streamlit secrets or environment variables.")
         else:
-            llm = ChatGroq(
-                    api_key=groq_api_key,
-                    model="openai/gpt-oss-20b",   # ✅ supported model
-                    temperature=0,
-                    max_tokens=512
-                    )
-            prompt_template = """Use the following context to answer the user’s question.
+            try:
+                llm = ChatGroq(
+                        api_key=groq_api_key,
+                        model="openai/gpt-oss-20b",   # ✅ Valid Groq model (as of Aug 2025)
+                        temperature=0,
+                        max_tokens=512
+                        )
+                prompt_template = """Use the following context to answer the user’s question.
 If you don’t know, just say so. Do not add extra info.
 
 {context}
 
 Question: {question}
 Answer:"""
-            PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-            qa_chain = ConversationalRetrievalChain.from_llm(
-                llm,
-                retriever=retriever,
-                return_source_documents=True,
-                combine_docs_chain_kwargs={"prompt": PROMPT}
-            )
-            st.session_state.llm = llm
-            st.session_state.prompt = PROMPT
-            st.session_state.qa_chain = qa_chain
-            st.session_state.bm25_index = bm25_index
-            st.session_state.kb_texts = kb_texts
+                PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+                qa_chain = ConversationalRetrievalChain.from_llm(
+                    llm,
+                    retriever=retriever,
+                    return_source_documents=True,
+                    combine_docs_chain_kwargs={"prompt": PROMPT}
+                )
+                st.session_state.llm = llm
+                st.session_state.prompt = PROMPT
+                st.session_state.qa_chain = qa_chain
+                st.session_state.bm25_index = bm25_index
+                st.session_state.kb_texts = kb_texts
+            except Exception as e:
+                st.error(f"❌ Failed to initialize QA chain: {str(e)}. Check logs for details.")
     else:
         st.session_state.qa_chain = None
 
@@ -234,6 +244,3 @@ if st.session_state.chat_history:
 
 st.markdown("---")
 st.caption("Patent FAQ Chatbot • Powered by Groq & LangChain • Strictly based on provided KB documents")
-
-
-

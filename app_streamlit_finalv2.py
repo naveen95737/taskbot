@@ -7,7 +7,8 @@ from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain.prompts import PromptTemplate  # Kept for potential future use; not central now
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.history_aware_retriever import create_history_aware_retriever  # ✅ Fixed submodule
+from langchain.chains.retrieval import create_retrieval_chain  # ✅ Fixed submodule
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
@@ -197,6 +198,13 @@ if uploaded_files:
         except Exception as e:
             st.sidebar.error(f"❌ Reload failed: {str(e)}")
 
+# Debug expander (remove in production)
+with st.sidebar.expander("🔍 Debug: Session State"):
+    st.write(f"QA Chain Loaded: {'✅' if 'qa_chain' in st.session_state else '❌'}")
+    st.write(f"LLM Loaded: {'✅' if 'llm' in st.session_state else '❌'}")
+    st.write(f"Retriever Loaded: {'✅' if st.session_state.get('qa_chain') else '❌'}")
+    st.write(f"Chat History Length: {len(st.session_state.get('chat_history', []))}")
+
 # -------------------------------
 # Initialize Session
 # -------------------------------
@@ -219,10 +227,12 @@ if "qa_chain" not in st.session_state:
                 st.session_state.qa_chain = qa_chain
                 st.session_state.bm25_index = bm25_index
                 st.session_state.kb_texts = kb_texts
+                st.success("✅ App initialized successfully!")
             except Exception as e:
                 st.error(f"❌ Failed to initialize QA chain: {str(e)}. Check logs for details.")
     else:
         st.session_state.qa_chain = None
+        st.warning("⚠️ No documents loaded—upload PDFs in sidebar to start.")
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
@@ -239,25 +249,30 @@ if query and st.session_state.qa_chain:
         sources = []
         related = []
     else:
-        # Convert chat_history to messages
-        chat_history_msgs = []
-        for human, ai in st.session_state.chat_history:
-            chat_history_msgs.extend([HumanMessage(content=human), AIMessage(content=ai)])
-        
-        result = st.session_state.qa_chain.invoke(
-            {
-                "input": query,
-                "chat_history": chat_history_msgs,
-            }
-        )
-        raw_answer = result["answer"]
-        answer = clean_answer(raw_answer)
-        sources = []
-        for doc in result.get("context", []):
-            source_file = os.path.basename(doc.metadata.get("source", ""))
-            page = doc.metadata.get("page", "N/A")
-            sources.append(f"{source_file} (Page {page})")
-        related = suggest_related_questions(query, st.session_state.bm25_index, st.session_state.kb_texts)
+        try:
+            # Convert chat_history to messages
+            chat_history_msgs = []
+            for human, ai in st.session_state.chat_history:
+                chat_history_msgs.extend([HumanMessage(content=human), AIMessage(content=ai)])
+            
+            result = st.session_state.qa_chain.invoke(
+                {
+                    "input": query,
+                    "chat_history": chat_history_msgs,
+                }
+            )
+            raw_answer = result["answer"]
+            answer = clean_answer(raw_answer)
+            sources = []
+            for doc in result.get("context", []):
+                source_file = os.path.basename(doc.metadata.get("source", ""))
+                page = doc.metadata.get("page", "N/A")
+                sources.append(f"{source_file} (Page {page})")
+            related = suggest_related_questions(query, st.session_state.bm25_index, st.session_state.kb_texts)
+        except Exception as e:
+            answer = f"Sorry, an error occurred during query processing: {str(e)}"
+            sources = []
+            related = []
 
     st.session_state.chat_history.append((query, answer))
     st.markdown(f"**You:** {query}")

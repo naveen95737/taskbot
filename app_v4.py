@@ -2,13 +2,17 @@ import os
 import re
 import hashlib
 import streamlit as st
+
+# LangChain + Ecosystem Imports (Latest Modular Setup)
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
-from langchain.chains import ConversationalRetrievalChain
+from langchain.chains.conversational_retrieval.base import ConversationalRetrievalChain
 from langchain.prompts import PromptTemplate
+
+# Keyword Search
 from rank_bm25 import BM25Okapi
 
 # -------------------------------
@@ -244,4 +248,5 @@ if st.session_state.chat_history:
         st.markdown(" ")  # Minimal spacing
 
 st.markdown("---")
+
 st.caption("Patent FAQ Chatbot • Powered by Groq & LangChain • Strictly based on provided KB documents")

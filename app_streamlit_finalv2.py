@@ -1,23 +1,20 @@
+
 import os
 import re
+import hashlib
+import logging
+import traceback
+from datetime import datetime
+
 import streamlit as st
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
-
-from langchain.chains.history_aware_retriever import create_history_aware_retriever  # ✅ Fixed submodule
-from langchain.chains.retrieval import create_retrieval_chain  # ✅ Fixed submodule
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, AIMessage
-try:
-    from rank_bm25 import BM25Okapi
-except ImportError:
-    st.error("Missing 'rank_bm25' package. Install via 'pip install rank_bm25'.")
-    BM25Okapi = None
-
+from langchain.chains import ConversationalRetrievalChain
+from langchain.prompts import PromptTemplate
+from rank_bm25 import BM25Okapi
 
 # -------------------------------
 # Config
@@ -31,6 +28,29 @@ st.set_page_config(page_title="Patent FAQ Chatbot", page_icon="📘", layout="wi
 st.title("📘 Patent FAQ Chatbot (India)")
 
 # -------------------------------
+# Simple Logging / Diagnostics
+# -------------------------------
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "streamlit_app.log")
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
+
+def log_exception(tag: str, exc: Exception):
+    logging.error("%s: %s", tag, str(exc))
+    logging.error(traceback.format_exc())
+    st.session_state.last_error = f"{tag}: {str(exc)}\n\n{traceback.format_exc()}"
+
+
+# Ensure session keys exist
+if "last_error" not in st.session_state:
+    st.session_state.last_error = None
+
+# -------------------------------
 # Load Knowledge Base
 # -------------------------------
 def load_knowledge_base():
@@ -38,8 +58,11 @@ def load_knowledge_base():
     docs = []
     for file in os.listdir(DATA_DIR):
         if file.endswith(".pdf"):
-            loader = PyPDFLoader(os.path.join(DATA_DIR, file))
-            docs.extend(loader.load())
+            try:
+                loader = PyPDFLoader(os.path.join(DATA_DIR, file))
+                docs.extend(loader.load())
+            except Exception as e:
+                logging.warning("Failed to load %s: %s", file, str(e))
 
     if not docs:
         return None, None, None
@@ -60,6 +83,7 @@ def load_knowledge_base():
 
     return vectorstore.as_retriever(search_kwargs={"k": 5}), bm25_index, kb_texts
 
+
 # -------------------------------
 # Handle Meta-History Questions
 # -------------------------------
@@ -72,6 +96,7 @@ def handle_history_question(query: str, chat_history: list):
         last_q, _ = chat_history[-1]
         return f"Your previous question was: '{last_q}'", True
     return None, False
+
 
 # -------------------------------
 # Related Question Suggestions
@@ -100,6 +125,7 @@ def suggest_related_questions(query, bm25_index, kb_texts, top_n=3):
             break
     return suggestions[:top_n]
 
+
 # -------------------------------
 # Clean Answer
 # -------------------------------
@@ -114,53 +140,6 @@ def clean_answer(text):
             seen.add(s)
     return ". ".join(cleaned) + "." if cleaned else text.strip()[:300]
 
-# -------------------------------
-# Create LCEL QA Chain
-# -------------------------------
-def create_convo_qa_chain(llm, retriever):
-    """Create the LCEL conversational retrieval chain."""
-    # Condense question prompt (rephrase using history)
-    condense_question_system_template = (
-        "Given a chat history and the latest user question "
-        "which might reference context in the chat history, "
-        "formulate a standalone question which can be understood "
-        "without the chat history. Do NOT answer the question, "
-        "just reformulate it if needed and otherwise return it as is."
-    )
-    condense_question_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", condense_question_system_template),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{input}"),
-        ]
-    )
-
-    # History-aware retriever
-    history_aware_retriever = create_history_aware_retriever(
-        llm, retriever, condense_question_prompt
-    )
-
-    # QA prompt (adapted from original: context + question, with history)
-    system_prompt = (
-        "Use the following pieces of retrieved context to answer the user’s question. "
-        "If you don’t know, just say so. Do not add extra info. "
-        "\n\n"
-        "{context}"
-    )
-    qa_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", system_prompt),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{input}"),
-        ]
-    )
-
-    # Stuff documents chain
-    qa_chain = create_stuff_documents_chain(llm, qa_prompt)
-
-    # Full retrieval chain
-    convo_qa_chain = create_retrieval_chain(history_aware_retriever, qa_chain)
-    return convo_qa_chain
 
 # -------------------------------
 # Sidebar: KB Management
@@ -184,58 +163,166 @@ uploaded_files = st.sidebar.file_uploader(
 if uploaded_files:
     for uf in uploaded_files:
         save_path = os.path.join(DATA_DIR, uf.name)
-        with open(save_path, "wb") as f:
-            f.write(uf.getbuffer())
-        st.sidebar.success(f"✅ Added: {uf.name}")
-    # Reload KB instantly
-    retriever, bm25_index, kb_texts = load_knowledge_base()
-    if retriever and "llm" in st.session_state:
         try:
-            st.session_state.qa_chain = create_convo_qa_chain(st.session_state.llm, retriever)
-            st.session_state.bm25_index = bm25_index
-            st.session_state.kb_texts = kb_texts
-            st.sidebar.success("🔄 Knowledge Base reloaded with new files!")
+            with open(save_path, "wb") as f:
+                f.write(uf.getbuffer())
+            st.sidebar.success(f"✅ Added: {uf.name}")
         except Exception as e:
-            st.sidebar.error(f"❌ Reload failed: {str(e)}")
+            log_exception("File save failed", e)
+            st.sidebar.error(f"Failed to save {uf.name}. See logs.")
 
-# Debug expander (remove in production)
-with st.sidebar.expander("🔍 Debug: Session State"):
-    st.write(f"QA Chain Loaded: {'✅' if 'qa_chain' in st.session_state else '❌'}")
-    st.write(f"LLM Loaded: {'✅' if 'llm' in st.session_state else '❌'}")
-    st.write(f"Retriever Loaded: {'✅' if st.session_state.get('qa_chain') else '❌'}")
-    st.write(f"Chat History Length: {len(st.session_state.get('chat_history', []))}")
+    # Rebuild KB (safely) and store BM25/texts even if LLM missing
+    try:
+        retriever, bm25_index, kb_texts = load_knowledge_base()
+        st.session_state.bm25_index = bm25_index
+        st.session_state.kb_texts = kb_texts
+        if retriever:
+            # only create QA chain if LLM + prompt exist
+            if st.session_state.get("llm") and st.session_state.get("prompt"):
+                try:
+                    st.session_state.qa_chain = ConversationalRetrievalChain.from_llm(
+                        llm=st.session_state.llm,
+                        retriever=retriever,
+                        return_source_documents=True,
+                        combine_docs_chain_kwargs={"prompt": st.session_state.prompt}
+                    )
+                    st.sidebar.success("🔄 Knowledge Base reloaded with new files and LLM attached!")
+                except Exception as e:
+                    log_exception("QA chain init after upload failed", e)
+                    st.sidebar.error("Error initializing QA chain after upload. Check logs (Show last error).")
+            else:
+                st.sidebar.info(
+                    "Knowledge base rebuilt. LLM not initialized — set GROQ_API_KEY or click 'Initialize LLM' below."
+                )
+        else:
+            st.sidebar.warning("No retriever could be built from uploaded files.")
+    except Exception as e:
+        log_exception("KB reload after upload failed", e)
+        st.sidebar.error("Failed to rebuild knowledge base. See logs (Show last error).")
+
+st.sidebar.markdown("---")
 
 # -------------------------------
 # Initialize Session
 # -------------------------------
 if "qa_chain" not in st.session_state:
-    retriever, bm25_index, kb_texts = load_knowledge_base()
+    try:
+        retriever, bm25_index, kb_texts = load_knowledge_base()
+    except Exception as e:
+        log_exception("Initial KB load failed", e)
+        retriever, bm25_index, kb_texts = None, None, None
+
     if retriever:
         groq_api_key = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY"))
         if not groq_api_key:
-            st.error("⚠️ Please set your GROQ_API_KEY in Streamlit secrets or environment variables.")
+            st.error(
+                "⚠️ GROQ_API_KEY is missing.\n\n"
+                "How to fix:\n"
+                "- Add GROQ_API_KEY in Streamlit app Secrets (App settings → Secrets) OR\n"
+                "- Set environment variable GROQ_API_KEY on the host/container.\n\n"
+                "After adding the key, either reload the app or click 'Initialize LLM' in the sidebar."
+            )
+            # still expose BM25/texts so suggestions work without LLM
+            st.session_state.bm25_index = bm25_index
+            st.session_state.kb_texts = kb_texts
+            st.session_state.qa_chain = None
         else:
             try:
                 llm = ChatGroq(
-                        api_key=groq_api_key,
-                        model="openai/gpt-oss-20b",
-                        temperature=0,
-                        max_tokens=512
-                        )
-                qa_chain = create_convo_qa_chain(llm, retriever)
+                    api_key=groq_api_key,
+                    model="openai/gpt-oss-20b",
+                    temperature=0,
+                    max_tokens=512
+                )
+                prompt_template = """Use the following context to answer the user’s question.
+If you don’t know, just say so. Do not add extra info.
+
+{context}
+
+Question: {question}
+Answer:"""
+                PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+                qa_chain = ConversationalRetrievalChain.from_llm(
+                    llm,
+                    retriever=retriever,
+                    return_source_documents=True,
+                    combine_docs_chain_kwargs={"prompt": PROMPT}
+                )
                 st.session_state.llm = llm
+                st.session_state.prompt = PROMPT
                 st.session_state.qa_chain = qa_chain
                 st.session_state.bm25_index = bm25_index
                 st.session_state.kb_texts = kb_texts
-                st.success("✅ App initialized successfully!")
+                st.success("✅ LLM initialized and knowledge base attached.")
             except Exception as e:
-                st.error(f"❌ Failed to initialize QA chain: {str(e)}. Check logs for details.")
+                log_exception("LLM / QA chain initialization failed", e)
+                st.error("Failed to initialize LLM or QA chain. Click 'Show last error' in the sidebar for details.")
     else:
         st.session_state.qa_chain = None
-        st.warning("⚠️ No documents loaded—upload PDFs in sidebar to start.")
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+
+# -------------------------------
+# Sidebar Controls: Initialize LLM / Show last error
+# -------------------------------
+if st.sidebar.button("Initialize LLM"):
+    try:
+        groq_api_key = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY"))
+        if not groq_api_key:
+            st.sidebar.error("GROQ_API_KEY not found. Add it to Streamlit Secrets or env vars, then try again.")
+        else:
+            retriever = None
+            # use existing retriever in session if available, otherwise rebuild
+            if st.session_state.get("bm25_index") and st.session_state.get("kb_texts"):
+                try:
+                    retriever, bm25_index, kb_texts = load_knowledge_base()
+                except Exception as e:
+                    log_exception("Load KB during Initialize LLM failed", e)
+            if not retriever:
+                st.sidebar.warning("No documents found to build KB. Upload PDFs first.")
+            else:
+                try:
+                    llm = ChatGroq(api_key=groq_api_key, model="openai/gpt-oss-20b", temperature=0, max_tokens=512)
+                    PROMPT = st.session_state.get("prompt") or PromptTemplate(
+                        template="""Use the following context to answer the user’s question.
+If you don’t know, just say so. Do not add extra info.
+
+{context}
+
+Question: {question}
+Answer:""", input_variables=["context", "question"]
+                    )
+                    qa_chain = ConversationalRetrievalChain.from_llm(
+                        llm, retriever=retriever, return_source_documents=True, combine_docs_chain_kwargs={"prompt": PROMPT}
+                    )
+                    st.session_state.llm = llm
+                    st.session_state.prompt = PROMPT
+                    st.session_state.qa_chain = qa_chain
+                    st.session_state.bm25_index = bm25_index
+                    st.session_state.kb_texts = kb_texts
+                    st.sidebar.success("✅ LLM initialized and QA chain created.")
+                except Exception as e:
+                    log_exception("Initialize LLM button failed", e)
+                    st.sidebar.error("Failed to initialize LLM. See logs (Show last error).")
+    except Exception as e:
+        log_exception("Initialize LLM outer failure", e)
+        st.sidebar.error("Unexpected error while initializing LLM. See logs (Show last error).")
+
+if st.sidebar.button("Show last error"):
+    last = st.session_state.get("last_error")
+    if last:
+        st.sidebar.text_area("Last captured exception", value=last, height=300)
+        try:
+            with open(LOG_FILE, "rb") as lf:
+                st.sidebar.download_button("Download full log", lf, file_name=os.path.basename(LOG_FILE))
+        except Exception as e:
+            log_exception("Failed to open log file", e)
+            st.sidebar.error("Unable to read log file.")
+    else:
+        st.sidebar.info("No errors captured in this session.")
+
+st.sidebar.markdown("---")
 
 # -------------------------------
 # Chat Input
@@ -250,27 +337,19 @@ if query and st.session_state.qa_chain:
         related = []
     else:
         try:
-            # Convert chat_history to messages
-            chat_history_msgs = []
-            for human, ai in st.session_state.chat_history:
-                chat_history_msgs.extend([HumanMessage(content=human), AIMessage(content=ai)])
-            
-            result = st.session_state.qa_chain.invoke(
-                {
-                    "input": query,
-                    "chat_history": chat_history_msgs,
-                }
-            )
-            raw_answer = result["answer"]
+            # Use the chain to get an answer and source documents
+            result = st.session_state.qa_chain.invoke({"question": query, "chat_history": st.session_state.chat_history})
+            raw_answer = result.get("answer", "")
             answer = clean_answer(raw_answer)
             sources = []
-            for doc in result.get("context", []):
+            for doc in result.get("source_documents", []):
                 source_file = os.path.basename(doc.metadata.get("source", ""))
                 page = doc.metadata.get("page", "N/A")
                 sources.append(f"{source_file} (Page {page})")
             related = suggest_related_questions(query, st.session_state.bm25_index, st.session_state.kb_texts)
         except Exception as e:
-            answer = f"Sorry, an error occurred during query processing: {str(e)}"
+            log_exception("Runtime QA invocation failed", e)
+            answer = "Sorry — an error occurred while generating an answer. Click 'Show last error' in the sidebar for details."
             sources = []
             related = []
 
@@ -299,4 +378,4 @@ if st.session_state.chat_history:
         st.markdown(" ")
 
 st.markdown("---")
-st.caption("Patent FAQ Chatbot • Powered by Groq & LangChain (LCEL) • Strictly based on provided KB documents")
+st.caption("Patent FAQ Chatbot • Powered by Groq & LangChain • Strictly based on provided KB documents")

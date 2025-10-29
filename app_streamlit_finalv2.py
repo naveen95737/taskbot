@@ -25,7 +25,7 @@ except Exception as e:
 
 # text splitter
 try:
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
 except Exception as e:
     _import_errors.append(("RecursiveCharacterTextSplitter", e))
     try:
@@ -101,60 +101,107 @@ if _import_errors:
         pass
 
 
-# Minimal conversational retrieval chain fallback implementation
+# Enhanced LLM caller with diagnostics and multiple common call patterns
 def _call_llm_text(llm, prompt_text: str) -> str:
-    """Try common call patterns to get text from an LLM wrapper (best-effort)."""
-    # direct call if callable
-    try:
-        if callable(llm):
-            out = llm(prompt_text)
-            # if returns dict or object, try to extract string
-            if isinstance(out, str):
-                return out
-            try:
-                # common LangChain LLMs return a string via .content or .text
-                if isinstance(out, dict) and "text" in out:
-                    return out["text"]
-                if hasattr(out, "content"):
-                    return str(out.content)
-                if hasattr(out, "text"):
-                    return str(out.text)
-            except Exception:
-                pass
-            return str(out)
-    except Exception:
-        pass
-    # try predict
-    try:
-        if hasattr(llm, "predict"):
-            return llm.predict(prompt_text)
-    except Exception:
-        pass
-    # try generate (LangChain style)
-    try:
-        if hasattr(llm, "generate"):
-            res = llm.generate([prompt_text])
-            # Try to extract text from result
-            try:
-                # LangChain Generation type handling (best-effort)
-                if hasattr(res, "generations"):
-                    # generations is list[list[Generation]]
+    """Enhanced LLM caller with diagnostics and multiple common call patterns."""
+    LOG_DIAG = os.path.join("logs", "llm_diagnostics.log")
+    os.makedirs(os.path.dirname(LOG_DIAG), exist_ok=True)
+
+    def _log(msg):
+        try:
+            with open(LOG_DIAG, "a") as lf:
+                lf.write(msg + "\n")
+        except Exception:
+            pass
+
+    _log(f"=== LLM call attempt at {datetime.utcnow().isoformat()} ===")
+    _log(f"Prompt (truncated): {prompt_text[:500]!r}")
+
+    # Helper to record exceptions
+    def _try_call(fn_name, call_fn):
+        try:
+            _log(f"Trying {fn_name}...")
+            res = call_fn()
+            _log(f"{fn_name} returned type: {type(res)}")
+            # try to extract text from common structures
+            if isinstance(res, str):
+                _log(f"{fn_name} produced str result.")
+                return res
+            if isinstance(res, dict):
+                if "text" in res:
+                    return res["text"]
+                if "answer" in res:
+                    return res["answer"]
+                # try to join string values
+                for v in res.values():
+                    if isinstance(v, str) and len(v) > 0:
+                        return v
+            # LangChain-style generation object
+            if hasattr(res, "generations"):
+                try:
                     gens = res.generations
                     if gens and gens[0]:
                         if hasattr(gens[0][0], "text"):
                             return gens[0][0].text
                         return str(gens[0][0])
-                if isinstance(res, list) and res:
-                    return str(res[0])
-                return str(res)
-            except Exception:
-                return str(res)
+                except Exception as e:
+                    _log(f"Extraction from generations failed: {e}")
+            # fallback to stringifying
+            return str(res)
+        except Exception as e:
+            _log(f"{fn_name} exception: {e}")
+            _log(traceback.format_exc())
+            return None
+
+    # 1) direct callable
+    if callable(llm):
+        out = _try_call("callable(llm)", lambda: llm(prompt_text))
+        if out:
+            return out
+
+    # 2) __call__ with dict / kwargs
+    out = _try_call("llm.__call__ with text", lambda: getattr(llm, "__call__", lambda *_: None)(prompt_text))
+    if out:
+        return out
+
+    # 3) predict / predict_text
+    for attr in ("predict", "predict_text", "generate_text"):
+        if hasattr(llm, attr):
+            out = _try_call(f"llm.{attr}", lambda: getattr(llm, attr)(prompt_text))
+            if out:
+                return out
+
+    # 4) chat / chat_completion / create_chat_completion patterns
+    if hasattr(llm, "chat") or hasattr(llm, "chat_completion") or hasattr(llm, "create_chat_completion"):
+        def _call_chat():
+            if hasattr(llm, "chat"):
+                return llm.chat([{"role":"user","content": prompt_text}])
+            if hasattr(llm, "chat_completion"):
+                return llm.chat_completion(messages=[{"role":"user","content": prompt_text}])
+            return llm.create_chat_completion(messages=[{"role":"user","content": prompt_text}])
+        out = _try_call("chat-style", _call_chat)
+        if out:
+            return out
+
+    # 5) generate (LangChain)
+    if hasattr(llm, "generate"):
+        out = _try_call("llm.generate", lambda: llm.generate([prompt_text]))
+        if out:
+            return out
+
+    # 6) fallback: inspect and log available attributes for manual debugging
+    try:
+        attrs = sorted([a for a in dir(llm) if not a.startswith("_")])
+        _log("LLM available attrs: " + ", ".join(attrs))
+        st.session_state.llm_diag = {"attrs": attrs, "diag_log": LOG_DIAG}
     except Exception:
         pass
-    # last resort
-    return "ERROR: LLM call failed — check LLM wrapper interface."
+
+    _log("All attempted call patterns failed; return error placeholder.")
+    return "ERROR: LLM call failed — check LLM wrapper interface. See logs/llm_diagnostics.log and use 'LLM diagnostics' in the sidebar."
 
 
+# Minimal conversational retrieval chain fallback implementation
 if not _conversational_chain_available:
     class MinimalConversationalRetrievalChain:
         """A minimal fallback that calls a retriever and then an LLM with the provided prompt template."""
@@ -480,7 +527,7 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
 # -------------------------------
-# Sidebar Controls: Initialize LLM / Show last error
+# Sidebar Controls: Initialize LLM / Show last error / Diagnostics
 # -------------------------------
 if st.sidebar.button("Initialize LLM"):
     try:
@@ -536,6 +583,31 @@ if st.sidebar.button("Show last error"):
             st.sidebar.error("Unable to read log file.")
     else:
         st.sidebar.info("No errors captured in this session.")
+
+# New: quick LLM diagnostics run
+if st.sidebar.button("LLM diagnostics"):
+    if not st.session_state.get("llm"):
+        st.sidebar.error("LLM not initialized. Click 'Initialize LLM' first and ensure GROQ_API_KEY is set.")
+    else:
+        try:
+            test_prompt = "Say 'hello' and return a short acknowledgement."
+            res = _call_llm_text(st.session_state.llm, test_prompt)
+            st.sidebar.markdown("**Diagnostics result:**")
+            st.sidebar.text_area("LLM response (diagnostic)", value=res, height=120)
+            diag = st.session_state.get("llm_diag")
+            if diag:
+                st.sidebar.markdown("**LLM attributes (truncated)**")
+                st.sidebar.write(diag.get("attrs")[:80])
+                st.sidebar.markdown(f"Diag log file: logs/llm_diagnostics.log")
+                try:
+                    with open(diag.get("diag_log"), "rb") as lf:
+                        st.sidebar.download_button("Download diagnostic log", lf, file_name=os.path.basename(diag.get("diag_log")))
+                except Exception as e:
+                    log_exception("Failed to open LLM diag log", e)
+                    st.sidebar.error("Unable to read LLM diagnostic log.")
+        except Exception as e:
+            log_exception("LLM diagnostics failed", e)
+            st.sidebar.error("LLM diagnostics failed. See 'Show last error' for details.")
 
 st.sidebar.markdown("---")
 

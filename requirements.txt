@@ -1,4 +1,4 @@
-# Core App Dependencies
+# Core
 streamlit>=1.37.0
 numpy>=1.26.0
 torch>=2.2.0
@@ -17,13 +17,11 @@ pypdf>=4.2.0
 faiss-cpu>=1.8.0
 rank_bm25>=0.2.2
 
-# LangChain Ecosystem (latest modular setup)
+# LangChain (old, stable versions for ConversationalRetrievalChain)
 langchain==0.1.17
 langchain-core==0.1.52
 langchain-community==0.0.37
-
-langchain-text-splitters>=0.3.0
-langchain-huggingface>=0.3.0
-langchain-groq>=0.3.0
+langchain-huggingface==0.0.5
+langchain-groq==0.0.2
 
 

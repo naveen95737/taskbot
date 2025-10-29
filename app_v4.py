@@ -7,7 +7,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
-from langchain.chains.retrieval import create_retrieval_chain
+from langchain.chains.combine_documents import create_retrieval_chain
 from langchain.prompts import PromptTemplate
 from rank_bm25 import BM25Okapi
 
@@ -61,7 +61,7 @@ def get_retriever(vector_db, bm25_index, corpus, query):
 
 # ---------------------- FUNCTION: CREATE LLM ----------------------
 def create_llm():
-    """Initialize Groq LLM (or any other supported model)."""
+    """Initialize Groq LLM."""
     groq_api_key = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY"))
     if not groq_api_key:
         st.error("❌ GROQ_API_KEY not found in environment variables or Streamlit secrets.")
@@ -94,7 +94,7 @@ if uploaded_pdf:
         with st.spinner("Thinking..."):
             relevant_docs = get_retriever(vector_db, bm25_index, corpus, user_input)
             context = "\n\n".join(relevant_docs[:3])
-            prompt = f"Answer the question based on the following context:\n{context}\n\nQuestion: {user_input}"
+            prompt = f"Answer the question based only on the following context:\n{context}\n\nQuestion: {user_input}"
             response = llm.invoke(prompt)
 
             st.session_state.chat_history.append(("You", user_input))

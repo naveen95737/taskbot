@@ -1,62 +1,49 @@
 """
 app_groq_kb.py
 Streamlit chatbot: KB-only answers (PDFs) + FAISS retrieval + BM25 suggestions + Groq LLM
-Set GROQ_API_KEY in Streamlit secrets or environment variables before deploying.
+Now with Conversation Memory — remembers previous Q&A and can answer meta-questions
 """
 
 import os
 import re
-import io
-import hashlib
 import time
-import json
-import pathlib
-from typing import List, Tuple, Dict
-
-import streamlit as st
 import pdfplumber
 import numpy as np
+import streamlit as st
+from typing import List, Tuple, Dict
 from sentence_transformers import SentenceTransformer
 import faiss
 from rank_bm25 import BM25Okapi
 
-# NOTE: we import ChatGroq from langchain_groq if available.
-# If your deployment requires a different Groq client, swap call_groq() implementation.
+# Optional Groq client from LangChain
 try:
     from langchain_groq import ChatGroq
 except Exception:
-    ChatGroq = None  # we will check later and show instructions if missing
+    ChatGroq = None  # Handle gracefully
 
 # -------------------------
-# Config
+# Configuration
 # -------------------------
 DATA_DIR = "knowledge_base"
 os.makedirs(DATA_DIR, exist_ok=True)
-
-# A fallback source URL to display with sources (customize if needed)
 SOURCE_URL = "http://www.ipindia.gov.in/ (FREQUENTLY ASKED QUESTIONS - PATENTS)"
 
-# Retriever artifacts (kept in session for speed)
-if "kb_index" not in st.session_state:
-    st.session_state.kb_index = None
-if "kb_texts" not in st.session_state:
-    st.session_state.kb_texts = []
-if "kb_metadatas" not in st.session_state:
-    st.session_state.kb_metadatas = []
-if "bm25" not in st.session_state:
-    st.session_state.bm25 = None
-if "embed_model" not in st.session_state:
-    st.session_state.embed_model = None
-if "faiss_index" not in st.session_state:
-    st.session_state.faiss_index = None
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+# Initialize session variables
+for key, default in {
+    "kb_texts": [],
+    "kb_metadatas": [],
+    "bm25": None,
+    "embed_model": None,
+    "faiss_index": None,
+    "chat_history": [],
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 # -------------------------
-# Helper: PDF -> chunks
+# PDF and Text Processing
 # -------------------------
 def extract_pdf_text_by_page(path: str) -> List[Tuple[int, str]]:
-    """Return list of (page_number, text) for the PDF."""
     pages = []
     with pdfplumber.open(path) as pdf:
         for i, page in enumerate(pdf.pages, start=1):
@@ -65,52 +52,43 @@ def extract_pdf_text_by_page(path: str) -> List[Tuple[int, str]]:
     return pages
 
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 200) -> List[str]:
-    """Simple chunking by characters preserving word boundaries."""
     if not text:
         return []
     text = re.sub(r"\s+", " ", text).strip()
     chunks = []
     start = 0
-    L = len(text)
-    while start < L:
-        end = min(start + chunk_size, L)
-        # backtrack to last space if not end
-        if end < L:
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        if end < len(text):
             while end > start and text[end] != " ":
                 end -= 1
-            if end == start:
-                end = min(start + chunk_size, L)  # forced
         chunk = text[start:end].strip()
         if chunk:
             chunks.append(chunk)
-        start = max(end - overlap, end)  # overlap
+        start = max(end - overlap, end)
     return chunks
 
 # -------------------------
-# Build KB (embeddings, FAISS, BM25)
+# Knowledge Base Builder
 # -------------------------
 def build_kb_from_folder(data_dir: str):
-    """Load all PDFs in DATA_DIR -> produce embeddings, faiss index, bm25 index, and metadata list."""
     files = [f for f in os.listdir(data_dir) if f.lower().endswith(".pdf")]
-    all_texts = []
-    metadatas = []  # list of dicts: {source, page}
+    all_texts, metadatas = [], []
     if not files:
-        return [], None, None, None
+        return [], [], None, None
 
     for fname in sorted(files):
         fpath = os.path.join(data_dir, fname)
-        pages = extract_pdf_text_by_page(fpath)
-        for page_no, raw_text in pages:
-            # chunk page text into smaller chunks
-            page_chunks = chunk_text(raw_text, chunk_size=900, overlap=200)
-            for chunk in page_chunks:
+        for page_no, raw_text in extract_pdf_text_by_page(fpath):
+            for chunk in chunk_text(raw_text):
                 all_texts.append(chunk)
                 metadatas.append({"source": fname, "page": page_no})
-    # create BM25
+
+    # BM25
     tokenized = [re.findall(r"\w+", t.lower()) for t in all_texts]
     bm25 = BM25Okapi(tokenized) if tokenized else None
 
-    # embeddings (sentence-transformers)
+    # Embeddings + FAISS
     model = st.session_state.get("embed_model")
     if model is None:
         model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
@@ -119,7 +97,7 @@ def build_kb_from_folder(data_dir: str):
     if all_texts:
         embeddings = model.encode(all_texts, show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=True)
         d = embeddings.shape[1]
-        index = faiss.IndexFlatIP(d)  # inner-product since embeddings normalized -> cosine similarity
+        index = faiss.IndexFlatIP(d)
         index.add(np.asarray(embeddings))
     else:
         index = None
@@ -127,37 +105,33 @@ def build_kb_from_folder(data_dir: str):
     return all_texts, metadatas, index, bm25
 
 # -------------------------
-# Utilities: search & suggestions
+# Search & Suggestion Utils
 # -------------------------
 def semantic_search(query: str, k: int = 4):
-    if st.session_state.faiss_index is None or st.session_state.kb_texts is None:
+    if st.session_state.faiss_index is None:
         return []
     model = st.session_state.embed_model
     q_emb = model.encode([query], convert_to_numpy=True, normalize_embeddings=True)
     D, I = st.session_state.faiss_index.search(np.asarray(q_emb), k)
     results = []
     for score, idx in zip(D[0], I[0]):
-        if idx < 0 or idx >= len(st.session_state.kb_texts):
-            continue
-        results.append((float(score), st.session_state.kb_texts[idx], st.session_state.kb_metadatas[idx]))
+        if 0 <= idx < len(st.session_state.kb_texts):
+            results.append((float(score), st.session_state.kb_texts[idx], st.session_state.kb_metadatas[idx]))
     return results
 
 def keyword_suggestions(query: str, top_n: int = 3):
-    bm25 = st.session_state.get("bm25")
-    corpus = st.session_state.get("kb_texts", [])
+    bm25, corpus = st.session_state.bm25, st.session_state.kb_texts
     if bm25 is None or not corpus:
         return []
-    tokenized_query = re.findall(r"\w+", query.lower())
-    scores = bm25.get_scores(tokenized_query)
+    tokens = re.findall(r"\w+", query.lower())
+    scores = bm25.get_scores(tokens)
     ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
     suggestions = []
-    for idx, score in ranked[:min(len(ranked), top_n*3)]:
+    for idx, _ in ranked[:top_n * 3]:
         text = corpus[idx]
-        # pick a sentence-like piece for suggestion
-        sentences = re.split(r"(?<=[.!?])\s+", text)
-        for s in sentences:
+        for s in re.split(r"(?<=[.!?])\s+", text):
             s_clean = s.strip()
-            if 40 < len(s_clean) < 160 and any(tok in s_clean.lower() for tok in tokenized_query):
+            if 40 < len(s_clean) < 160 and any(tok in s_clean.lower() for tok in tokens):
                 if not s_clean.endswith("?"):
                     s_clean += "?"
                 suggestions.append(s_clean)
@@ -167,7 +141,7 @@ def keyword_suggestions(query: str, top_n: int = 3):
     return suggestions
 
 # -------------------------
-# LLM: call Groq
+# Groq Client
 # -------------------------
 def init_groq_client():
     if ChatGroq is None:
@@ -175,190 +149,166 @@ def init_groq_client():
     api_key = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY"))
     if not api_key:
         return None
-    # initialize ChatGroq (langchain_groq wrapper) - usage may vary depending on package version
     try:
-        client = ChatGroq(api_key=api_key, model="llama-3.1-8b-instant", temperature=0.0)
+        return ChatGroq(api_key=api_key, model="llama-3.1-8b-instant", temperature=0.0)
     except TypeError:
-        # alternative signature (older/newer)
-        client = ChatGroq(model="llama-3.1-8b-instant", groq_api_key=api_key, temperature=0.0)
-    return client
+        return ChatGroq(model="llama-3.1-8b-instant", groq_api_key=api_key, temperature=0.0)
 
-def call_groq_chat(client, prompt: str, max_tokens: int = 512) -> str:
-    """
-    Call Groq client and return assistant text.
-    This function uses ChatGroq.invoke() if available, else tries .chat or .complete depending on installed SDK.
-    """
+def call_groq_chat(client, prompt: str) -> str:
     if client is None:
-        raise RuntimeError("Groq client not initialized. Set GROQ_API_KEY and install langchain_groq.")
-    # try several call styles to maximize compatibility
+        raise RuntimeError("Groq client not initialized.")
     try:
-        # langchain_groq.ChatGroq: .invoke or .generate or .chat may exist
         if hasattr(client, "invoke"):
             out = client.invoke(prompt)
-            if isinstance(out, str):
-                return out
-            # langchain-like response
-            if hasattr(out, "content"):
-                return out.content
-            if isinstance(out, dict) and "content" in out:
-                return out["content"]
-        if hasattr(client, "chat"):
+            return out if isinstance(out, str) else getattr(out, "content", str(out))
+        elif hasattr(client, "chat"):
             res = client.chat([{"role": "user", "content": prompt}])
-            if isinstance(res, dict) and "content" in res:
-                return res["content"]
-            if hasattr(res, "content"):
-                return res.content
-        if hasattr(client, "generate"):
-            res = client.generate(prompt)
-            if isinstance(res, dict) and "text" in res:
-                return res["text"]
+            return res.get("content", "") if isinstance(res, dict) else getattr(res, "content", "")
     except Exception as e:
         st.error(f"Error calling Groq: {e}")
-        raise
-    # last-resort: stringfy
-    return str(out)
+    return ""
 
 # -------------------------
-# High-level answer pipeline
+# Conversation Memory Helpers
+# -------------------------
+def summarize_chat_history(chat_history: List[Dict], max_turns: int = 5) -> str:
+    if not chat_history:
+        return ""
+    summary = []
+    for turn in chat_history[-max_turns:]:
+        summary.append(f"User: {turn['q']}\nAssistant: {turn['a']}")
+    return "\n".join(summary)
+
+def detect_memory_query(user_query: str) -> bool:
+    keywords = [
+        "previous question", "earlier question", "last question",
+        "what were we talking", "previous topic", "remind me what we discussed",
+        "earlier chat", "past conversation", "what did i ask", "summary of chat"
+    ]
+    text = user_query.lower()
+    return any(kw in text for kw in keywords)
+
+def answer_from_memory(user_query: str, chat_history: List[Dict]) -> str:
+    if not chat_history:
+        return "We haven’t talked about anything yet."
+    last_turn = chat_history[-1]
+    if "last question" in user_query.lower() or "previous question" in user_query.lower():
+        return f"Your previous question was: '{last_turn['q']}'"
+    elif "previous answer" in user_query.lower():
+        return f"My previous answer was: '{last_turn['a']}'"
+    elif "talking about" in user_query.lower() or "discussing" in user_query.lower():
+        return f"We were talking about: '{last_turn['q']}' — {last_turn['a'][:200]}..."
+    elif "summary" in user_query.lower():
+        return summarize_chat_history(chat_history)
+    else:
+        return summarize_chat_history(chat_history)
+
+# -------------------------
+# Answer Composition
 # -------------------------
 def compose_context(sem_results: List[Tuple[float, str, Dict]], k=3) -> str:
-    selected = sem_results[:k]
     parts = []
-    for score, text, meta in selected:
+    for score, text, meta in sem_results[:k]:
         src = meta.get("source", "Uploaded PDF")
         page = meta.get("page", "N/A")
         parts.append(f"[Source: {src} | Page: {page}]\n{text}")
     return "\n\n---\n\n".join(parts)
 
 def generate_answer_groq(client, question: str, context: str) -> str:
-    """
-    Provide a strict KB-only answer instruction. If the KB doesn't contain the answer, instruct model to reply:
-    "I don’t have an exact answer in the knowledge base."
-    """
-    # Safety: limit context size
     if len(context) > 32000:
         context = context[-32000:]
     prompt = (
-        "You are an assistant that answers only using the provided context. "
-        "Do NOT invent facts. If the answer is not contained explicitly in the context, respond with: "
-        "\"I don't have an exact answer in the knowledge base.\" "
-        "Always keep answers concise and mention source filenames and page numbers at the end.\n\n"
-        f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
+        "You are an assistant that answers ONLY using the provided context. "
+        "If the answer is not in the context, respond: 'I don't have an exact answer in the knowledge base.'\n\n"
+        f"Context:\n{context}\n\nQuestion: {question}\nAnswer:"
     )
-    response = call_groq_chat(client, prompt)
-    # Ensure response doesn't hallucinate sources — user is responsible to inspect source section shown separately
-    return response.strip()
+    return call_groq_chat(client, prompt).strip()
 
 # -------------------------
-# UI: Sidebar - upload & reload
+# Streamlit UI
 # -------------------------
 st.set_page_config(page_title="Patent FAQ Chatbot (Groq)", layout="wide", page_icon="📘")
-st.title("📘 Patent FAQ Chatbot — Groq (KB-only answers)")
+st.title("📘 Patent FAQ Chatbot — Groq (KB + Memory)")
 
+# Sidebar
 with st.sidebar:
     st.header("Knowledge Base")
-    st.markdown("Upload PDFs to add to the knowledge base (or push files into `knowledge_base/` on the repo).")
     uploaded = st.file_uploader("Upload PDF(s)", type="pdf", accept_multiple_files=True)
     if uploaded:
         for uf in uploaded:
             path = os.path.join(DATA_DIR, uf.name)
             with open(path, "wb") as f:
                 f.write(uf.read())
-        st.success(f"Saved {len(uploaded)} file(s). Please click **Reload KB** to rebuild indexes.")
+        st.success(f"Saved {len(uploaded)} file(s). Click Reload KB below.")
+
     if st.button("🔄 Reload KB"):
-        with st.spinner("Building knowledge base (embeddings + index)..."):
+        with st.spinner("Building knowledge base..."):
             texts, metas, index, bm25 = build_kb_from_folder(DATA_DIR)
             st.session_state.kb_texts = texts
             st.session_state.kb_metadatas = metas
             st.session_state.faiss_index = index
             st.session_state.bm25 = bm25
-        st.success("Knowledge base reloaded.")
+        st.success("Knowledge base rebuilt!")
 
-    st.markdown("---")
     st.header("Groq Settings")
-    groq_ok = ChatGroq is not None and (st.secrets.get("GROQ_API_KEY", None) or os.getenv("GROQ_API_KEY"))
-    if not groq_ok:
-        st.warning("Groq client NOT available or GROQ_API_KEY missing. Set GROQ_API_KEY in Streamlit secrets.")
+    if not (ChatGroq and (st.secrets.get("GROQ_API_KEY") or os.getenv("GROQ_API_KEY"))):
+        st.warning("⚠️ Missing Groq API key. Add it in Streamlit Secrets.")
     else:
-        st.write("Groq available. Using configured API key.")
-    st.markdown("")
+        st.info("✅ Groq client configured successfully.")
 
-# initialize if not loaded yet
-if st.session_state.get("kb_texts") is None or st.session_state.get("faiss_index") is None:
-    # automatic build if folder contains PDFs
-    with st.spinner("Checking knowledge base..."):
+# Init KB and Groq
+if not st.session_state.kb_texts:
+    with st.spinner("Initializing KB..."):
         texts, metas, index, bm25 = build_kb_from_folder(DATA_DIR)
-        st.session_state.kb_texts = texts
-        st.session_state.kb_metadatas = metas
-        st.session_state.faiss_index = index
-        st.session_state.bm25 = bm25
+        st.session_state.kb_texts, st.session_state.kb_metadatas = texts, metas
+        st.session_state.faiss_index, st.session_state.bm25 = index, bm25
 
-# initialize Groq client (lazily)
 if "groq_client" not in st.session_state:
     st.session_state.groq_client = init_groq_client()
 
-# -------------------------
-# Chat UI
-# -------------------------
-st.subheader("Ask questions (about uploaded PDFs) — I'll answer only from the documents.")
-
-query = st.text_input("Your question:", key="user_query")
-col1, col2 = st.columns([3, 1])
-
-with col2:
-    if st.button("Suggest related FAQs"):
-        if query:
-            s = keyword_suggestions(query, top_n=4)
-            if s:
-                st.success("Suggested related questions:")
-                for q in s:
-                    st.markdown(f"- {q}")
-            else:
-                st.info("No close matches found for suggestions.")
-        else:
-            st.info("Type a short query first to get suggestions.")
+# Chat Interface
+st.subheader("💬 Ask questions based on uploaded documents")
+query = st.text_input("Your question:")
 
 if query:
-    # quick checks
-    if not st.session_state.faiss_index or not st.session_state.kb_texts:
-        st.warning("Knowledge base empty — upload PDFs and click Reload KB (sidebar) or push PDFs to `knowledge_base/`.")
+    if not st.session_state.faiss_index:
+        st.warning("Upload PDFs and click Reload KB first.")
     elif st.session_state.groq_client is None:
-        st.error("Groq client not initialized. Set GROQ_API_KEY in Streamlit secrets and include langchain_groq in requirements.")
+        st.error("Groq client not initialized.")
     else:
-        with st.spinner("Retrieving relevant passages..."):
-            sem = semantic_search(query, k=6)  # returns list of (score, text, meta)
-            # optional threshold to consider "no result"
-            top_scores = [s for s, _, _ in sem]
-            max_score = max(top_scores) if top_scores else 0.0
-            # also get BM25 suggestions
-            suggestions = keyword_suggestions(query, top_n=4)
+        if detect_memory_query(query):
+            answer_text = answer_from_memory(query, st.session_state.chat_history)
+            used_sources = []
+        else:
+            with st.spinner("Retrieving relevant passages..."):
+                sem = semantic_search(query, k=6)
+                top_scores = [s for s, _, _ in sem]
+                max_score = max(top_scores) if top_scores else 0.0
+                suggestions = keyword_suggestions(query, top_n=4)
 
-            # Decide if KB likely contains answer (heuristic)
-            if max_score < 0.20 and (not suggestions):
-                answer_text = "I don't have an exact answer in the knowledge base."
-                used_sources = []
-            else:
-                context = compose_context(sem, k=4)
-                answer_text = generate_answer_groq(st.session_state.groq_client, query, context)
-                # collect sources shown in context
-                used_sources = []
-                for _, _, meta in sem[:4]:
-                    used_sources.append(f"{meta.get('source','Uploaded PDF')} (Page {meta.get('page','N/A')})")
+                if max_score < 0.20 and not suggestions:
+                    answer_text = "I don't have an exact answer in the knowledge base."
+                    used_sources = []
+                else:
+                    chat_context = summarize_chat_history(st.session_state.chat_history, max_turns=4)
+                    context = compose_context(sem, k=4)
+                    full_context = f"Previous conversation:\n{chat_context}\n\nKnowledge Base Context:\n{context}"
+                    answer_text = generate_answer_groq(st.session_state.groq_client, query, full_context)
+                    used_sources = [f"{m.get('source')} (Page {m.get('page')})" for _, _, m in sem[:4]]
 
-        # Save to chat history
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         st.session_state.chat_history.append({"q": query, "a": answer_text, "sources": used_sources, "time": timestamp})
 
-# Display history (most recent first)
+# Display Chat History
 if st.session_state.chat_history:
-    st.markdown("### Conversation")
+    st.markdown("### 📝 Conversation History")
     for turn in reversed(st.session_state.chat_history[-12:]):
         st.markdown(f"**You:** {turn['q']}")
         st.markdown(f"**Bot:** {turn['a']}")
         if turn["sources"]:
-            with st.expander("Sources"):
+            with st.expander("📚 Sources"):
                 for s in turn["sources"]:
-                    st.caption(f"{s} — Source URL: {SOURCE_URL}")
+                    st.caption(f"{s} — {SOURCE_URL}")
         st.markdown("---")
 
-st.caption("Strictly answers from uploaded PDFs. If the KB doesn't contain an answer, the bot will say so and show related FAQ suggestions.")
+st.caption("Patent FAQ Chatbot • Powered by Groq + FAISS + BM25 • Memory enabled for contextual Q&A.")

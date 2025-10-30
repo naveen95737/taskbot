@@ -1,27 +1,23 @@
-# Core dependencies
-streamlit==1.38.0
-numpy==1.26.4
-torch==2.9.0
-tqdm==4.67.1
-transformers==4.46.2
-sentence-transformers==2.7.0
-nltk==3.9.1
-pdfplumber==0.11.0
-pypdf==6.1.0
-faiss-cpu==1.12.0
-rank_bm25==0.2.2
 
-# LangChain ecosystem (pinned for compatibility)
-langchain==0.1.17
-langchain-core==0.1.52
-langchain-community==0.0.37
-langchain-huggingface==0.3.0
-langchain-groq==0.3.0
-langchain-text-splitters==0.0.1
+# Core & runtime
+streamlit>=1.38.0
+numpy>=1.26.0
+tqdm>=4.66.0
+
+# ML & Embeddings
+sentence-transformers>=2.2.2
+transformers>=4.40.0
+
+# PDF handling
+pdfplumber>=0.11.0
+pypdf>=6.1.0
+
+# Indexing & retrieval
+faiss-cpu>=1.12.0
+rank_bm25>=0.2.2
+
+# Groq client via langchain_groq (optional, used in code)
+langchain-groq>=0.3.0
 
 # Utilities
-PyYAML==6.0.2
-SQLAlchemy==2.0.44
-aiohttp==3.9.5
-dataclasses-json==0.6.7
-jsonpatch==1.33
+PyYAML>=6.0

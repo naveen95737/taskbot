@@ -1,22 +1,21 @@
-streamlit>=1.38.0
-numpy>=1.26.0
-torch>=2.2.0
-tqdm>=4.66.0
+streamlit==1.37.1
+numpy==1.26.4
+torch==2.2.2
+tqdm==4.66.4
 
-transformers>=4.40.0
-sentence-transformers>=2.5.1
-nltk>=3.8.1
+transformers==4.40.1
+sentence-transformers==2.5.1
+nltk==3.8.1
 
-pdfplumber>=0.10.3
-pypdf>=4.2.0
+pdfplumber==0.10.3
+pypdf==4.2.0
 
-faiss-cpu>=1.8.0
-rank_bm25>=0.2.2
+faiss-cpu==1.8.0
+rank_bm25==0.2.2
 
-langchain>=0.1.17
-langchain-core>=0.1.52
-langchain-community>=0.0.37
-langchain-text-splitters>=0.3.0
-langchain-huggingface>=0.3.0
-langchain-groq>=0.3.0
-
+# LangChain ecosystem – compatible unified versions
+langchain==0.1.17
+langchain-core==0.1.52
+langchain-community==0.0.37
+langchain-huggingface==0.0.5
+langchain-groq==0.0.2

@@ -1,33 +1,32 @@
 import os
+import re
+import hashlib
 import streamlit as st
-from transformers import pipeline
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain.chains import RetrievalQA
-from langchain_community.llms import HuggingFacePipeline
+from langchain_groq import ChatGroq
+from langchain.chains import ConversationalRetrievalChain
+from langchain.prompts import PromptTemplate
 from rank_bm25 import BM25Okapi
-import re
 
 # -------------------------------
 # Config
 # -------------------------------
 DATA_DIR = "knowledge_base"
 os.makedirs(DATA_DIR, exist_ok=True)
+
 SOURCE_URL = "http://www.ipindia.gov.in/ (FREQUENTLY ASKED QUESTIONS - PATENTS)"
 
-# Globals for keyword suggestions
-bm25_index = None
-kb_texts = []
+st.set_page_config(page_title="Patent FAQ Chatbot", page_icon="📘", layout="wide")
+st.title("📘 Patent FAQ Chatbot (India)")
 
 # -------------------------------
-# Load KB function
+# Load Knowledge Base
 # -------------------------------
 def load_knowledge_base():
-    """Load all PDFs from DATA_DIR, build FAISS index, and return QA chain."""
-    global bm25_index, kb_texts
-
+    """Load PDFs, create FAISS index, return retriever + BM25 index."""
     docs = []
     for file in os.listdir(DATA_DIR):
         if file.endswith(".pdf"):
@@ -35,137 +34,202 @@ def load_knowledge_base():
             docs.extend(loader.load())
 
     if not docs:
-        return None
+        return None, None, None
 
-    # Split into chunks
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
     split_docs = text_splitter.split_documents(docs)
 
-    # Embeddings
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
         model_kwargs={"device": "cpu"}
     )
-
-    # FAISS vector store
     vectorstore = FAISS.from_documents(split_docs, embeddings)
 
-    # Generative LLM pipeline
-    gen_pipeline = pipeline(
-        "text2text-generation",
-        model="google/flan-t5-small",
-        device=-1
-    )
-    llm = HuggingFacePipeline(pipeline=gen_pipeline)
-
-    # Prepare BM25 for keyword-based suggestions
+    # BM25 for keyword-based suggestions
     kb_texts = [doc.page_content for doc in split_docs]
     tokenized_corpus = [re.findall(r"\w+", t.lower()) for t in kb_texts]
     bm25_index = BM25Okapi(tokenized_corpus)
 
-    return RetrievalQA.from_chain_type(
-        llm=llm,
-        retriever=vectorstore.as_retriever(),
-        return_source_documents=True
-    )
+    return vectorstore.as_retriever(search_kwargs={"k": 5}), bm25_index, kb_texts
+
+# -------------------------------
+# Handle Meta-History Questions
+# -------------------------------
+def handle_history_question(query: str, chat_history: list):
+    """Detect and respond to questions about conversation history."""
+    query_lower = query.lower().strip()
+    if any(x in query_lower for x in ["previous question", "last question"]):
+        if not chat_history:
+            return "No previous question yet.", True
+        last_q, _ = chat_history[-1]
+        return f"Your previous question was: '{last_q}'", True
+    return None, False
 
 # -------------------------------
 # Related Question Suggestions
 # -------------------------------
-def suggest_related_questions(query, top_n=3):
-    """Return top related KB questions (based on BM25)."""
-    global bm25_index, kb_texts
-    if not bm25_index:
+def suggest_related_questions(query, bm25_index, kb_texts, top_n=3):
+    if not bm25_index or not kb_texts:
         return []
-    tokenized_query = re.findall(r"\w+", query.lower())
-    scores = bm25_index.get_scores(tokenized_query)
+    keywords = re.findall(r"\w+", query.lower())
+    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
+    keywords = [kw for kw in keywords if kw not in stop_words and len(kw) > 2]
+    if not keywords:
+        return []
+    scores = bm25_index.get_scores(keywords)
     ranked = sorted(zip(scores, kb_texts), key=lambda x: x[0], reverse=True)
-    suggestions = [t for _, t in ranked[:top_n]]
-    return suggestions
+    suggestions = []
+    for _, text in ranked[:top_n * 3]:
+        sentences = re.split(r'[.!?]+', text)
+        for s in sentences:
+            s_clean = s.strip()
+            if 40 < len(s_clean) < 150 and any(kw in s_clean.lower() for kw in keywords):
+                if not s_clean.endswith("?"):
+                    s_clean += "?"
+                suggestions.append(s_clean)
+                break
+        if len(suggestions) >= top_n:
+            break
+    return suggestions[:top_n]
 
 # -------------------------------
-# Streamlit UI
+# Clean Answer
 # -------------------------------
-st.set_page_config(page_title="Patent FAQ Chatbot", page_icon="📘", layout="wide")
-st.title("📘 Knowledge-Base Chatbot (Patents)")
+def clean_answer(text):
+    if not text.strip():
+        return "I don't have a specific answer in the knowledge base."
+    sentences = [s.strip() for s in text.split(".") if len(s.strip()) > 10]
+    seen, cleaned = set(), []
+    for s in sentences:
+        if s not in seen:
+            cleaned.append(s)
+            seen.add(s)
+    return ". ".join(cleaned) + "." if cleaned else text.strip()[:300]
 
-# Sidebar – KB management
+# -------------------------------
+# Sidebar: KB Management
+# -------------------------------
 st.sidebar.header("📂 Knowledge Base Management")
 
-uploaded_files = st.sidebar.file_uploader(
-    "Upload new PDF(s) to KB",
-    type=["pdf"],
-    accept_multiple_files=True
-)
-if uploaded_files:
-    for uploaded_file in uploaded_files:
-        save_path = os.path.join(DATA_DIR, uploaded_file.name)
-        with open(save_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-    st.sidebar.success(f"Uploaded {len(uploaded_files)} file(s).")
-
-if st.sidebar.button("🔄 Reload Knowledge Base"):
-    st.session_state.qa_chain = load_knowledge_base()
-    st.sidebar.success("Knowledge base reloaded!")
-
 # Show current KB files
-st.sidebar.subheader("📑 Current KB Files")
 kb_files = [f for f in os.listdir(DATA_DIR) if f.endswith(".pdf")]
 if kb_files:
+    st.sidebar.subheader("📑 Current KB Files")
     for f in kb_files:
-        st.sidebar.write(f"- {f}")
+        st.sidebar.write(f"📄 {f}")
 else:
-    st.sidebar.info("No PDFs uploaded yet.")
+    st.sidebar.warning("⚠️ No PDFs found in knowledge_base folder.")
+
+# File uploader for new PDFs
+uploaded_files = st.sidebar.file_uploader(
+    "Upload additional PDF(s)", type=["pdf"], accept_multiple_files=True
+)
+
+if uploaded_files:
+    for uf in uploaded_files:
+        save_path = os.path.join(DATA_DIR, uf.name)
+        with open(save_path, "wb") as f:
+            f.write(uf.getbuffer())
+        st.sidebar.success(f"✅ Added: {uf.name}")
+    # Reload KB instantly
+    retriever, bm25_index, kb_texts = load_knowledge_base()
+    if retriever:
+        st.session_state.qa_chain = ConversationalRetrievalChain.from_llm(
+            llm=st.session_state.llm,
+            retriever=retriever,
+            return_source_documents=True,
+            combine_docs_chain_kwargs={"prompt": st.session_state.prompt}
+        )
+        st.session_state.bm25_index = bm25_index
+        st.session_state.kb_texts = kb_texts
+        st.sidebar.success("🔄 Knowledge Base reloaded with new files!")
 
 # -------------------------------
-# Initialize QA chain
+# Initialize Session
 # -------------------------------
 if "qa_chain" not in st.session_state:
-    st.session_state.qa_chain = load_knowledge_base()
+    retriever, bm25_index, kb_texts = load_knowledge_base()
+    if retriever:
+        groq_api_key = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY"))
+        if not groq_api_key:
+            st.error("⚠️ Please set your GROQ_API_KEY in Streamlit secrets or environment variables.")
+        else:
+            llm = ChatGroq(
+                    api_key=groq_api_key,
+                    model="openai/gpt-oss-20b",   # ✅ supported model
+                    temperature=0,
+                    max_tokens=512
+                    )
+            prompt_template = """Use the following context to answer the user’s question.
+If you don’t know, just say so. Do not add extra info.
+
+{context}
+
+Question: {question}
+Answer:"""
+            PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+            qa_chain = ConversationalRetrievalChain.from_llm(
+                llm,
+                retriever=retriever,
+                return_source_documents=True,
+                combine_docs_chain_kwargs={"prompt": PROMPT}
+            )
+            st.session_state.llm = llm
+            st.session_state.prompt = PROMPT
+            st.session_state.qa_chain = qa_chain
+            st.session_state.bm25_index = bm25_index
+            st.session_state.kb_texts = kb_texts
+    else:
+        st.session_state.qa_chain = None
+
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
 # -------------------------------
-# Chat UI
+# Chat Input
 # -------------------------------
-st.subheader("💬 Chat with the Knowledge Base")
-query = st.text_input("Ask a question about patents in India:")
+query = st.text_input("💬 Ask a question about patents in India:")
 
-if query:
-    if st.session_state.qa_chain:
-        result = st.session_state.qa_chain.invoke({"query": query})
-        answer = result["result"]
-
+if query and st.session_state.qa_chain:
+    meta_response, is_meta = handle_history_question(query, st.session_state.chat_history)
+    if is_meta:
+        answer = meta_response
+        sources = []
+        related = []
+    else:
+        result = st.session_state.qa_chain.invoke({"question": query, "chat_history": st.session_state.chat_history})
+        raw_answer = result["answer"]
+        answer = clean_answer(raw_answer)
         sources = []
         for doc in result.get("source_documents", []):
-            sources.append(f"{doc.metadata.get('source', 'Unknown Source')}")
+            source_file = os.path.basename(doc.metadata.get("source", ""))
+            page = doc.metadata.get("page", "N/A")
+            sources.append(f"{source_file} (Page {page})")
+        related = suggest_related_questions(query, st.session_state.bm25_index, st.session_state.kb_texts)
 
-        # Save chat history
-        st.session_state.chat_history.append(
-            {"q": query, "a": answer, "sources": list(set(sources))}
-        )
+    st.session_state.chat_history.append((query, answer))
+    st.markdown(f"**You:** {query}")
+    st.markdown(f"**Bot:** {answer}")
 
-        # Related Q suggestions
-        related = suggest_related_questions(query, top_n=3)
-        if related:
-            st.session_state.chat_history[-1]["related"] = related
-    else:
-        st.warning("Please upload and reload KB first.")
+    if sources:
+        with st.expander("📖 Sources"):
+            for s in sources:
+                st.caption(f"{s} — Source URL: {SOURCE_URL}")
 
-# Display chat history
-for entry in reversed(st.session_state.chat_history):
-    st.markdown(f"**You:** {entry['q']}")
-    st.markdown(f"**Bot:** {entry['a']}")
-    if entry.get("sources"):
-        with st.expander("Source(s)"):
-            for _ in entry["sources"]:
-                st.caption(f"Source URL: {SOURCE_URL}")
-    if entry.get("related"):
-        with st.expander("💡 Related Questions"):
-            for rq in entry["related"]:
-                st.write(f"- {rq}")
-    st.markdown("---")
+    if related:
+        st.info("💡 Suggested Related Questions:")
+        for rq in related:
+            st.markdown(f"- {rq}")
 
-# Clear chat
-if st.button("🧹 Clear Chat"):
-    st.session_state.chat_history = []
+# -------------------------------
+# Display Chat History
+# -------------------------------
+if st.session_state.chat_history:
+    st.subheader("📝 Conversation History")
+    for q, a in reversed(st.session_state.chat_history):
+        st.markdown(f"**You:** {q}")
+        st.markdown(f"**Bot:** {a}")
+        st.markdown(" ")
+
+st.markdown("---")
+st.caption("Patent FAQ Chatbot • Powered by Groq & LangChain • Strictly based on provided KB documents")

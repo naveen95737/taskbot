@@ -13,7 +13,7 @@ pypdf>=4.2.0
 faiss-cpu>=1.8.0
 rank_bm25>=0.2.2
 
-# LangChain ecosystem (modular)
+# LangChain modular ecosystem (latest compatible versions)
 langchain>=0.1.17
 langchain-core>=0.1.52
 langchain-community>=0.0.37

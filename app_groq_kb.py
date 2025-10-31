@@ -242,7 +242,7 @@ def generate_answer_groq(client, question: str, context: str) -> str:
 # Streamlit UI
 # -------------------------
 st.set_page_config(page_title="Patent FAQ Chatbot (Groq)", layout="wide", page_icon="📘")
-st.title("📘 Patent FAQ Chatbot — Groq (KB + Memory + Suggestions)")
+st.title("📘 Patent FAQ Chatbot")
 
 # Sidebar
 with st.sidebar:
@@ -352,3 +352,4 @@ if st.session_state.chat_history:
         st.markdown("---")
 
 st.caption("Patent FAQ Chatbot • Powered by Groq & LangChain ")
+

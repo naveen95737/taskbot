@@ -1,7 +1,7 @@
 """
 app_groq_kb.py
 Streamlit chatbot: KB-only answers (PDFs) + FAISS retrieval + BM25 suggestions + Groq LLM
-Now with Conversation Memory — remembers previous Q&A and can answer meta-questions
+Now with Conversation Memory, History Awareness, and Clean Answer Handling.
 """
 
 import os
@@ -141,6 +141,20 @@ def keyword_suggestions(query: str, top_n: int = 3):
     return suggestions
 
 # -------------------------
+# Clean Answer
+# -------------------------
+def clean_answer(text):
+    if not text.strip():
+        return "I don't have a specific answer in the knowledge base."
+    sentences = [s.strip() for s in text.split(".") if len(s.strip()) > 10]
+    seen, cleaned = set(), []
+    for s in sentences:
+        if s not in seen:
+            cleaned.append(s)
+            seen.add(s)
+    return ". ".join(cleaned) + "." if cleaned else text.strip()[:300]
+
+# -------------------------
 # Groq Client
 # -------------------------
 def init_groq_client():
@@ -222,34 +236,46 @@ def generate_answer_groq(client, question: str, context: str) -> str:
         "If the answer is not in the context, respond: 'I don't have an exact answer in the knowledge base.'\n\n"
         f"Context:\n{context}\n\nQuestion: {question}\nAnswer:"
     )
-    return call_groq_chat(client, prompt).strip()
+    return clean_answer(call_groq_chat(client, prompt).strip())
 
 # -------------------------
 # Streamlit UI
 # -------------------------
 st.set_page_config(page_title="Patent FAQ Chatbot (Groq)", layout="wide", page_icon="📘")
-st.title("📘 Patent FAQ Chatbot — Groq (KB + Memory)")
+st.title("📘 Patent FAQ Chatbot — Groq (KB + Memory + Suggestions)")
 
 # Sidebar
 with st.sidebar:
-    st.header("Knowledge Base")
+    st.header("📂 Knowledge Base Management")
+
+    kb_files = [f for f in os.listdir(DATA_DIR) if f.lower().endswith(".pdf")]
+    if kb_files:
+        st.subheader("📑 Current KB Files")
+        for f in kb_files:
+            st.write(f"📄 {f}")
+    else:
+        st.warning("⚠️ No PDFs in knowledge_base folder.")
+
     uploaded = st.file_uploader("Upload PDF(s)", type="pdf", accept_multiple_files=True)
     if uploaded:
         for uf in uploaded:
             path = os.path.join(DATA_DIR, uf.name)
             with open(path, "wb") as f:
                 f.write(uf.read())
-        st.success(f"Saved {len(uploaded)} file(s). Click Reload KB below.")
+        st.success(f"✅ Saved {len(uploaded)} file(s). KB will be rebuilt now.")
+        texts, metas, index, bm25 = build_kb_from_folder(DATA_DIR)
+        st.session_state.kb_texts, st.session_state.kb_metadatas = texts, metas
+        st.session_state.faiss_index, st.session_state.bm25 = index, bm25
+        st.info("🔄 Knowledge base rebuilt successfully!")
 
-    if st.button("🔄 Reload KB"):
-        with st.spinner("Building knowledge base..."):
+    if st.button("🔁 Rebuild KB manually"):
+        with st.spinner("Rebuilding KB..."):
             texts, metas, index, bm25 = build_kb_from_folder(DATA_DIR)
-            st.session_state.kb_texts = texts
-            st.session_state.kb_metadatas = metas
-            st.session_state.faiss_index = index
-            st.session_state.bm25 = bm25
-        st.success("Knowledge base rebuilt!")
+            st.session_state.kb_texts, st.session_state.kb_metadatas = texts, metas
+            st.session_state.faiss_index, st.session_state.bm25 = index, bm25
+        st.success("✅ KB rebuilt!")
 
+    st.markdown("---")
     st.header("Groq Settings")
     if not (ChatGroq and (st.secrets.get("GROQ_API_KEY") or os.getenv("GROQ_API_KEY"))):
         st.warning("⚠️ Missing Groq API key. Add it in Streamlit Secrets.")
@@ -272,7 +298,7 @@ query = st.text_input("Your question:")
 
 if query:
     if not st.session_state.faiss_index:
-        st.warning("Upload PDFs and click Reload KB first.")
+        st.warning("Upload PDFs and rebuild KB first.")
     elif st.session_state.groq_client is None:
         st.error("Groq client not initialized.")
     else:
@@ -299,6 +325,20 @@ if query:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         st.session_state.chat_history.append({"q": query, "a": answer_text, "sources": used_sources, "time": timestamp})
 
+        st.markdown(f"**You:** {query}")
+        st.markdown(f"**Bot:** {answer_text}")
+
+        if used_sources:
+            with st.expander("📖 Sources"):
+                for s in used_sources:
+                    st.caption(f"{s} — {SOURCE_URL}")
+
+        suggestions = keyword_suggestions(query, top_n=3)
+        if suggestions:
+            st.info("💡 Suggested Related Questions:")
+            for s in suggestions:
+                st.markdown(f"- {s}")
+
 # Display Chat History
 if st.session_state.chat_history:
     st.markdown("### 📝 Conversation History")
@@ -311,4 +351,4 @@ if st.session_state.chat_history:
                     st.caption(f"{s} — {SOURCE_URL}")
         st.markdown("---")
 
-st.caption("Patent FAQ Chatbot • Powered by Groq + FAISS + BM25 • Memory enabled for contextual Q&A.")
+st.caption("Patent FAQ Chatbot • Powered by Groq & LangChain ")

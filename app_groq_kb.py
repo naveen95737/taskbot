@@ -29,7 +29,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SOURCE_URL = "http://www.ipindia.gov.in/ (FREQUENTLY ASKED QUESTIONS - PATENTS)"
 
 # Semantic-match threshold (tunable)
-SEMANTIC_SCORE_THRESHOLD = 0.07  # lowered from 0.20 to reduce false negatives
+SEMANTIC_SCORE_THRESHOLD = 0.6  # lowered from 0.20 to reduce false negatives
 
 # Initialize session variables
 for key, default in {
@@ -449,5 +449,6 @@ if st.session_state.chat_history:
         st.markdown("---")
 
 st.caption("Patent FAQ Chatbot • Powered by Groq & LangChain • Context + KB Memory + Related Suggestions")
+
 
 
